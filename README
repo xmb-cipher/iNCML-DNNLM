@@ -7,15 +7,10 @@ The following sub-directory of the current directory is assumed:
 
 1. config -- containing user-defined configuration file 
 	
-	Here's an example of ptb's configration. Each line describes a layer
-	of the neural network. The first token is surrounded with angel 
+	An example of ptb's configration is in config. Each line describes a
+	layer of the neural network. The first token is surrounded with angel 
 	brackets. The rest are (option, parameter) pairs. See 
 	./source/network.cpp for details of what options are supported.
-
-	<projection-layer> input 2 output 256 vocabulary 10001 projection 128 momentum 0.9 weight-decay 0.00004 forgetting-factor 0.7
-	<sFSMN-layer> input 256 output 512 momentum 0.9 weight-decay 0.00004 order 20
-	<ReLU-layer> input 512 output 512 momentum 0.9 weight-decay 0.00004
-	<softmax-layer> input 512 output 10001 momentum 0.9 weight-decay 0.00004 lnZ 11
 
 2. log -- containing execution logging
 	It's strongly recommended to put the logging here and name them according
@@ -59,6 +54,6 @@ The following sub-directory of the current directory is assumed:
 
 Using PTB as example:
 1. compose your own network configuration and save it in ./config/ptb.config
-2. run “prepare.sh ptb”
+2. run “prepare.sh ptb 1 10001”
 3. run "trainer ptb.config ptb 0.4096 256 2 | tee log/ptb.config.log”
 
