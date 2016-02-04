@@ -57,9 +57,10 @@ The following sub-directory of the current directory is assumed:
 	configuration file, <config>.epoch{i}
 
 
-################################################################################
-####################  INSTRUCTIONS TO RUN EXPERIMENTS  #########################
-################################################################################
+
+
+##################################
+## INSTRUCTIONS TO RUN EXPERIMENTS 
 
 Using PTB as example:
 
