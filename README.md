@@ -1,6 +1,22 @@
 # iNCML-DNNLM
 A CUDA-C implementation of FOFE and FSMN
 
+================================================================================
+
+For technical details on:
+
+i) FOFE: refer to
+
+[1] S. Zhang, H. Jiang, M. Xu, J. Hou, L. Dai, ”The Fixed-Size Ordinally-Forgetting Encoding Method for Neural Network Language Models,” Proc. of Annual Meeting of the Association for Computational Linguistics (ACL 2015), July 2015.  (http://anthology.aclweb.org/P/P15/P15-2081.pdf)
+
+ii) FSMN: refer to
+
+[2] S. Zhang, H. Jiang, S. Wei, L. Dai, “Feedforward Sequential Memory Neural Networks without Recurrent Feedback,” arXiv:1510.02693. (http://arxiv.org/abs/1510.02693)
+
+[3] S. Zhang, C. Liu, H. Jiang, S. Wei, L. Dai and Y. Hu, “Feedforward Sequential Memory Networks: A New Structure to Learn Long-term Dependency,” arXiv:1512.08301. (http://arxiv.org/abs/1512.08301)
+
+
+================================================================================
 
 All files must following the naming convention of basename.{extension}. 
 Examples are shown with PTB (Penn TreeBank) which is shipped with the code.
