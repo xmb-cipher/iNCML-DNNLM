@@ -59,8 +59,8 @@ The following sub-directory of the current directory is assumed:
 
 
 
-##################################
-## INSTRUCTIONS TO RUN EXPERIMENTS 
+
+================================================================================
 
 Using PTB as example:
 
