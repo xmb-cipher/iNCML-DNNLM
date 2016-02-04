@@ -58,21 +58,19 @@ The following sub-directory of the current directory is assumed:
 	layer.cpp   
 	matrix.h   
 	matrix.cu      
-	network.h 
-	network.cpp
+	network.h     
+	network.cpp    
 	stacktrace.h  
 	numericize.cpp  
 	trainer.cpp           
-	vocabulary.cpp 
+	vocabulary.cpp     
 	evaluator.cpp  
 
 6. model-archive
 
 	During training, for example, ptb.config.epoch{i}, the model at the 
 	beginning of the ith epoch is dumped on the disk. It's named with the 
-	configuration file, <config>.epoch{i}
-
-
+	configuration file, followed by ".epoch{i}".
 
 
 
@@ -85,5 +83,9 @@ Using PTB as example:
 2. run “prepare.sh ptb 1 10001”
 
 3. run "trainer ptb.config ptb 0.4096 256 2 | tee log/ptb.config.log”
+
+    learning-rate  0.4096    
+    mini-batch     256    
+    context window 2    
 
 
