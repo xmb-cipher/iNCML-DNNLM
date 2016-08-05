@@ -29,77 +29,77 @@ using namespace std;
 
 int main( int argc, char** argv ) {
 
-	if ( argc == 6 || argc == 7 ) {
-		const char* config = argv[1];
-		const char* model = argv[2];
-		const char* data = argv[3];
-		int order = atoi( argv[4] );
-		int batch = atoi( argv[5] );
+    if ( argc == 6 || argc == 7 ) {
+        const char* config = argv[1];
+        const char* model = argv[2];
+        const char* data = argv[3];
+        int order = atoi( argv[4] );
+        int batch = atoi( argv[5] );
 
-		float lnZ = 0.0f;
-		if ( argc > 6 ) {
-			lnZ = atof( argv[6] );
-			ASSERT( lnZ > 0.0f );
-		}
+        float lnZ = 0.0f;
+        if ( argc > 6 ) {
+            lnZ = atof( argv[6] );
+            ASSERT( lnZ > 0.0f );
+        }
 
-		BatchConstructor bc( data, order, batch, 0, false );
-		Network network( config );
-		network.LoadParam( model );
+        BatchConstructor bc( data, order, batch, 0, false );
+        Network network( config );
+        network.LoadParam( model );
 
-		Matrix placeholder;
-		Matrix buffer;
-		double loss = 0.0;
-		int nExample = 0;
+        Matrix placeholder;
+        Matrix buffer;
+        double loss = 0.0;
+        int nExample = 0;
 
-		while( bc.HasNext() ) {
-			bc.PrepareNext();
+        while( bc.HasNext() ) {
+            bc.PrepareNext();
 
-			const SubMatrix input = bc.GetInput();
-			const SubMatrix target = bc.GetTarget();
+            const SubMatrix input = bc.GetInput();
+            const SubMatrix target = bc.GetTarget();
 
-			ExtraInfo info( input.Rows(),
-							bc.GetSentenceLength(),
-							false,
-							target,			// actually not used
-							placeholder );	// not used either
-			network.Prepare( info );
+            ExtraInfo info( input.Rows(),
+                            bc.GetSentenceLength(),
+                            false,
+                            target,            // actually not used
+                            placeholder );    // not used either
+            network.Prepare( info );
 
-			const MatrixBase& output = network.Compute( input );
+            const MatrixBase& output = network.Compute( input );
 
-			if ( lnZ == 0.0f ) {
-				loss += output.Xent( target );
-				nExample += output.Rows();
-			}
-			else {
-				buffer.Reshape( output.Rows(), output.Columns() );
-				buffer.Copy( output );
-				buffer.Shift( -lnZ );
-				buffer.Exp( buffer );
-				loss += buffer.Xent( target );
-				nExample += output.Rows();
-			}
-		}
+            if ( lnZ == 0.0f ) {
+                loss += output.Xent( target );
+                nExample += output.Rows();
+            }
+            else {
+                buffer.Reshape( output.Rows(), output.Columns() );
+                buffer.Copy( output );
+                buffer.Shift( -lnZ );
+                buffer.Exp( buffer );
+                loss += buffer.Xent( target );
+                nExample += output.Rows();
+            }
+        }
 
-		double avgLoss = loss / (double)nExample;
-		double ppl = exp(avgLoss);
-		cout << right
-			 << CurrentTime() << ") average cross-entropy loss of " << nExample
-			 << " examples: " << KGRN << avgLoss << KNRM << " or "
+        double avgLoss = loss / (double)nExample;
+        double ppl = exp(avgLoss);
+        cout << right
+             << CurrentTime() << ") average cross-entropy loss of " << nExample
+             << " examples: " << KGRN << avgLoss << KNRM << " or "
              << KGRN << ppl << KNRM << " in PPL " << endl;
 
-		return EXIT_SUCCESS;
-	}
+        return EXIT_SUCCESS;
+    }
 
-	else {
-		cerr << KRED;
-		cerr << "Usag: " << argv[0] << " <config> <model> <numeric-data> <order> <batch-size> [lnZ]" << endl;
-		cerr << "    <config>       : network configuration" << endl;
-		cerr << "    <model>        : trained model corresponding to config" << endl;
-		cerr << "    <numeric-data> : data set to be evaluated, in numeric form" << endl;
-		cerr << "    <order>        : length of context window" << endl;
-		cerr << "    <batch-size>   : mini-batch size" << endl;
-		cerr << "    [lnZ]          : optional, if set, softmax is not applied" << endl;
-		cerr << KNRM;
-		exit( EXIT_FAILURE );
-	}
+    else {
+        cerr << KRED;
+        cerr << "Usag: " << argv[0] << " <config> <model> <numeric-data> <order> <batch-size> [lnZ]" << endl;
+        cerr << "    <config>       : network configuration" << endl;
+        cerr << "    <model>        : trained model corresponding to config" << endl;
+        cerr << "    <numeric-data> : data set to be evaluated, in numeric form" << endl;
+        cerr << "    <order>        : length of context window" << endl;
+        cerr << "    <batch-size>   : mini-batch size" << endl;
+        cerr << "    [lnZ]          : optional, if set, softmax is not applied" << endl;
+        cerr << KNRM;
+        exit( EXIT_FAILURE );
+    }
 }

@@ -1,7 +1,7 @@
 /*
 Author      : Mingbin Xu (mingbin.xu@gmail.com)
 Filename    : matrix.h
-Last Update : Feb 2, 2016
+Last Update : Mar 28, 2016
 Description : Provide interfaces of general purpose of matrix in CUDA
 Website     : https://wiki.eecs.yorku.ca/lab/MLL/
 
@@ -16,9 +16,14 @@ License: MIT License (see ../LICENSE)
 #include "stacktrace.h"
 
 #include <cublas_v2.h>
+#include <cusparse_v2.h>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <curand.h>
+
+#ifdef XT
+    #include <cublasXt.h>
+#endif
 
 #include <thrust/device_ptr.h>
 #include <thrust/device_vector.h>
@@ -29,11 +34,14 @@ License: MIT License (see ../LICENSE)
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cfloat>
 #include <cassert>
 #include <sstream>
 #include <string>
 #include <iostream>
 #include <iomanip>
+#include <algorithm>
+
 using namespace std;
 
 
@@ -45,6 +53,7 @@ using namespace std;
 #define KERNEL_CHECK( name )            __kernelCheck( __FILE__, __LINE__, name )
 #define CUBLAS_CHECK( status, name )    __cublasCheck( status, __FILE__, __LINE__, name )
 #define CURAND_CHECK( status, name )    __curandCheck( status, __FILE__, __LINE__, name )
+#define CUSPARSE_CHECK( status, name )  __cusparseCheck( status, __FILE__, __LINE__, name )
 #define ASSERT( status )                __assert( status, __FILE__, __LINE__ );
 
 
@@ -66,7 +75,49 @@ inline void __assert( bool status, const char* file, int line )
         print_stacktrace();   
         exit( EXIT_FAILURE );                       
     }                                               
-}                               
+}      
+
+
+inline void __cusparseCheck
+(
+            cusparseStatus_t    status,
+    const   char*               file,
+            int                 line,
+    const   char*               name
+) 
+{
+#ifdef DEBUG
+    switch( status ) {
+        case CUSPARSE_STATUS_NOT_INITIALIZED:
+            cout << "CUSPARSE_STATUS_NOT_INITIALIZED" << endl; 
+            break;
+        case CUSPARSE_STATUS_ALLOC_FAILED:
+            cout << "CUSPARSE_STATUS_ALLOC_FAILED" << endl; 
+            break;
+        case CUSPARSE_STATUS_INVALID_VALUE:
+            cout << "CUSPARSE_STATUS_INVALID_VALUE" << endl; 
+            break;
+        case CUSPARSE_STATUS_ARCH_MISMATCH:
+            cout << "CUSPARSE_STATUS_ARCH_MISMATCH" << endl; 
+            break;
+        case CUSPARSE_STATUS_EXECUTION_FAILED:
+            cout << "CUSPARSE_STATUS_EXECUTION_FAILED" << endl; 
+            break;
+        case CUSPARSE_STATUS_INTERNAL_ERROR:
+            cout << "CUSPARSE_STATUS_INTERNAL_ERROR" << endl; 
+            break;
+        case CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED:
+            cout << "CUSPARSE_STATUS_MATRIX_TYPE_NOT_SUPPORTED" << endl; 
+            break;
+    }
+#endif
+    if ( status != CUSPARSE_STATUS_SUCCESS ) 
+    {
+        fprintf( stderr, "%10s %4d: %s failed\n", file, line, name );
+        print_stacktrace();
+        exit( EXIT_FAILURE );
+    }
+}                         
 
 
 
@@ -147,6 +198,12 @@ inline void __cublasCheck
         case CUBLAS_STATUS_EXECUTION_FAILED:
             fprintf( stderr, "CUBLAS_STATUS_EXECUTION_FAILED\n" );
             break;
+        case CUBLAS_STATUS_ALLOC_FAILED:
+            fprintf( stderr, "CUBLAS_STATUS_ALLOC_FAILED\n" );
+            break;
+        case CUBLAS_STATUS_LICENSE_ERROR:
+            fprintf( stderr, "CUBLAS_STATUS_LICENSE_ERROR\n" );
+            break;
     }
 #endif
     if ( status != CUBLAS_STATUS_SUCCESS )
@@ -217,7 +274,7 @@ struct MatrixRange {
 
 
 enum FunctionType {
-    kSigmoid,
+    kSigmoid,   // 0
     kRelu,
     kExp,
     kReciprocal,
@@ -225,11 +282,12 @@ enum FunctionType {
     kFill,
     kScale,
     kShift,
+    kClip,
 
-    kSetZero,
+    kSetZero,   // 9
     kUndefined,
 
-    kDiffSigmoid,
+    kDiffSigmoid, // 11
     kDiffReLU,
     kDiffNCE,
     kLowerBound,
@@ -237,8 +295,62 @@ enum FunctionType {
     kGetRows,
     kGetColumns,
     kAddRows,
-    kAddColumns
+    kAddColumns, 
+
+    kMaxReduce,
+    kMinReduce,
+    kSumReduce
 };
+
+// ==========================================================================================
+
+/* CSR format is used since all cuSPARSE function takes CSR. */
+class MatrixBase;
+class Matrix;
+class SparseMatrix {
+private:
+    int     m_nnz;
+    int        m_n_row;
+    int     m_n_column;
+    float*     m_data;
+    int*     m_indices;
+    int*    m_indptr;
+    int     m_n_byte;
+    
+protected:
+    static cusparseHandle_t handle;
+    static cusparseMatDescr_t descriptor;
+    static int n_matrix;
+    static Matrix* buffer;      // also makes the GPU assignment consistent
+    
+public:
+    friend class MatrixBase;
+    friend class Matrix;
+    friend class SubMatix;
+
+    SparseMatrix();
+
+    SparseMatrix( const vector<float>& data, 
+                  const vector<int>& indices, 
+                  const vector<int>& indptr,
+                  int n_column = 0 );
+                  
+    virtual ~SparseMatrix();
+    
+    void SetData( const vector<float>& data, 
+                  const vector<int>& indices, 
+                  const vector<int>& indptr,
+                  int n_column = 0 );
+    
+    inline int Rows() const {
+        return m_n_row;
+    }
+
+
+    inline int Columns() const {
+        return m_n_column;
+    }
+};    // end of SparseMatrix
 
 
 // ==========================================================================================
@@ -260,14 +372,22 @@ protected:
     static int n_matrix;
     static cublasHandle_t handle;
     static curandGenerator_t generator;
+    static cudaStream_t stream;
+
+#ifdef XT
+    static cublasXtHandle_t xt_handle;
+#endif
+
 
     MatrixBase()  : m_data( NULL ), m_n_row( 0 ), m_n_column( 0 ), m_n_stride( 0 ), m_n_allocated( 0 ) {
     }   // end of MatrixBase
 
+    void m_clear_buffer();
 
 public:
     friend class Matrix;
     friend class SubMatrix;
+    friend class SparseMatrix;
 
     virtual ~MatrixBase() {
     }   // end of ~MatrixBase
@@ -294,6 +414,8 @@ public:
     
     void SetData( const vector<float>& data );
 
+    void SetDataAsync( const vector<float>& data );
+
     string ToString() const;
     
     MatrixShape Shape() const;
@@ -303,6 +425,18 @@ public:
     void Sgemm( float beta, float alpha,
                 const MatrixBase& A, cublasOperation_t transa,
                 const MatrixBase& B, cublasOperation_t transb );
+                
+    void Sgemm( float beta, float alpha,
+                const MatrixBase& A, cusparseOperation_t transa,
+                const SparseMatrix& B, cusparseOperation_t transb );
+
+    void Sgemm( float beta, float alpha,
+                const SparseMatrix& A, cusparseOperation_t transa,
+                const MatrixBase& B, cusparseOperation_t transb );
+
+    void Strmm( float alpha,
+                const MatrixBase& A, cublasSideMode_t side, cublasFillMode_t uplo,
+                const MatrixBase& B, cublasOperation_t trans = CUBLAS_OP_N );
 
     // this = value
     void Fill( float value );
@@ -363,6 +497,7 @@ public:
     //     this[i] = column
     // effectively: this = beta * this + alpha * dot(column, ones(1, m_n_column))
     void Add( float beta, float alpha, const MatrixBase& other, cublasOperation_t = CUBLAS_OP_N );
+    void Add( float alpha, const MatrixBase& other );
 
     // this = beta * this + alpha * matrix.sum(0)
     void SumRowsOf( const MatrixBase& matrix, float beta = 0.0f, float alpha = 1.0f );
@@ -439,11 +574,18 @@ public:
                             const MatrixBase& position,
                             float alpha );
 
+
+    void Clip( float lower, float upper );
+
     float Min();
 
     float Max();
 
     float Sum();
+
+    float L2Norm();
+    
+    void Sparse2Dense( const SparseMatrix& other );
 };  // end of MatrixBase
 
 

@@ -9,7 +9,7 @@ Copyright (c) 2016 iNCML (author: Mingbin Xu)
 License: MIT License (see ../LICENSE)
  */
 
-// nvcc -Xcompiler -rdynamic -lcurand -lcublas -o ../main matrix.cu -DMATRIX_UNIT_TEST
+// nvcc -Xcompiler -rdynamic -lcurand -lcublas -lcusparse -o ../main matrix.cu -DMATRIX_UNIT_TEST
 
 
 #include "matrix.h"
@@ -19,6 +19,373 @@ struct TestNanOrInf {
         return isnan(x) || isinf(x);
     }
 };
+
+
+int closest2Power(int x) {
+    assert( x > 0 );
+    int result = 1;
+    while ( result <= x ) {
+        result *= 2;
+    }
+    return result / 2;
+}
+
+
+
+__global__ static  void Clip( float* value, MatrixShape shape, float lower, float upper ) {
+    int r = threadIdx.x + blockDim.x * blockIdx.x;
+    int c = threadIdx.y + blockDim.y * blockIdx.y;
+    if ( r < shape.row && c < shape.column ) {
+        float __result = value[r * shape.stride + c];
+        if ( isinf(__result) || isnan(__result) ) {
+            __result = 0.0f;
+        }
+        else if ( __result < lower ) {
+            __result = lower;
+        }
+        else if ( __result > upper ) {
+            __result = upper;
+        }
+        value[r * shape.stride + c] = __result;
+    }
+}   // end of Clip
+
+
+
+__global__ static void L2Norm( const float* __restrict__ value, MatrixShape shape,
+                               float* result, int stride ) {
+    extern __shared__ float buffer[];   // length is blockDim.x
+
+    buffer[threadIdx.x] = 0.0f;
+    const float* bor = value + blockIdx.x * shape.stride;
+
+    for ( int i = threadIdx.x; i < shape.column; i += blockDim.x ) {
+        buffer[threadIdx.x] += bor[i] * bor[i];
+    }
+    __syncthreads();
+
+    if ( blockDim.x >= 512 ) {
+        if ( threadIdx.x < 256 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 256];
+        }
+        __syncthreads();
+    }
+
+    if ( blockDim.x >= 256 ) {
+        if ( threadIdx.x < 128 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 128];
+        }
+        __syncthreads();
+    } 
+
+    if ( blockDim.x >= 128 ) {
+        if ( threadIdx.x < 64 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 64];
+        }
+        __syncthreads();
+    } 
+
+    if ( threadIdx.x < 32 ) {
+        if ( blockDim.x >= 64 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 32];
+        }
+        if ( blockDim.x >= 32 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 16];
+        }
+        if ( blockDim.x >= 16 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 8];
+        }
+        if ( blockDim.x >= 8 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 4];
+        }
+        if ( blockDim.x >= 4 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 2];
+        }
+        if ( blockDim.x >= 2 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 1];
+        }
+    }
+
+    if ( threadIdx.x == 0 ) {
+        result[blockIdx.x * stride] = buffer[0];
+    }
+}   // end of L2Norm
+
+
+
+
+
+__global__ static void SumReduce( const float* __restrict__ value, MatrixShape shape,
+                                  float* result, int stride ) {
+    extern __shared__ float buffer[];   // length is blockDim.x
+
+    buffer[threadIdx.x] = 0.0f;
+    const float* bor = value + blockIdx.x * shape.stride;
+
+    for ( int i = threadIdx.x; i < shape.column; i += blockDim.x ) {
+        buffer[threadIdx.x] += bor[i];
+    }
+    __syncthreads();
+
+    if ( blockDim.x >= 512 ) {
+        if ( threadIdx.x < 256 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 256];
+        }
+        __syncthreads();
+    }
+
+    if ( blockDim.x >= 256 ) {
+        if ( threadIdx.x < 128 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 128];
+        }
+        __syncthreads();
+    } 
+
+    if ( blockDim.x >= 128 ) {
+        if ( threadIdx.x < 64 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 64];
+        }
+        __syncthreads();
+    } 
+
+    if ( threadIdx.x < 32 ) {
+        if ( blockDim.x >= 64 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 32];
+        }
+        if ( blockDim.x >= 32 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 16];
+        }
+        if ( blockDim.x >= 16 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 8];
+        }
+        if ( blockDim.x >= 8 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 4];
+        }
+        if ( blockDim.x >= 4 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 2];
+        }
+        if ( blockDim.x >= 2 ) {
+            buffer[threadIdx.x] += buffer[threadIdx.x + 1];
+        }
+    }
+
+    if ( threadIdx.x == 0 ) {
+        result[blockIdx.x * stride] = buffer[0];
+    }
+}   // end of SumReduce
+
+
+__global__ static void MaxReduce( const float* __restrict__ value, MatrixShape shape,
+                                  float* result, int stride ) {
+    extern __shared__ float buffer[];   // length is blockDim.x
+
+    buffer[threadIdx.x] = FLT_MIN;
+    const float* bor = value + blockIdx.x * shape.stride;
+
+    for ( int i = threadIdx.x; i < shape.column; i += blockDim.x ) {
+        buffer[threadIdx.x] = fmaxf(buffer[threadIdx.x], bor[i]);
+    }
+    __syncthreads();
+
+    if ( blockDim.x >= 512 ) {
+        if ( threadIdx.x < 256 ) {
+            buffer[threadIdx.x] = fmaxf(buffer[threadIdx.x], buffer[threadIdx.x + 256]);
+        }
+        __syncthreads();
+    }
+
+    if ( blockDim.x >= 256 ) {
+        if ( threadIdx.x < 128 ) {
+            buffer[threadIdx.x] = fmaxf(buffer[threadIdx.x], buffer[threadIdx.x + 128]);
+        }
+        __syncthreads();
+    } 
+
+    if ( blockDim.x >= 128 ) {
+        if ( threadIdx.x < 64 ) {
+            buffer[threadIdx.x] = fmaxf(buffer[threadIdx.x], buffer[threadIdx.x + 64]);
+        }
+        __syncthreads();
+    } 
+
+    if ( blockDim.x >= 64 && threadIdx.x < 32 ) {
+        buffer[threadIdx.x] = fmaxf(buffer[threadIdx.x], buffer[threadIdx.x + 32]);
+    }
+    if ( blockDim.x >= 32 && threadIdx.x < 16 ) {
+        buffer[threadIdx.x] = fmaxf(buffer[threadIdx.x], buffer[threadIdx.x + 16]);
+    }
+    if ( blockDim.x >= 16 && threadIdx.x < 8 ) {
+        buffer[threadIdx.x] = fmaxf(buffer[threadIdx.x], buffer[threadIdx.x + 8]);
+    }
+    if ( blockDim.x >= 8 && threadIdx.x < 4 ) {
+        buffer[threadIdx.x] = fmaxf(buffer[threadIdx.x], buffer[threadIdx.x + 4]);
+    }
+    if ( blockDim.x >= 4 && threadIdx.x < 2 ) {
+        buffer[threadIdx.x] = fmaxf(buffer[threadIdx.x], buffer[threadIdx.x + 2]);
+    }
+    if ( blockDim.x >= 2 && threadIdx.x < 1 ) {
+        buffer[threadIdx.x] = fmaxf(buffer[threadIdx.x], buffer[threadIdx.x + 1]);
+    }
+
+    if ( threadIdx.x == 0 ) {
+        result[blockIdx.x * stride] = buffer[0];
+    }
+}   // end of MaxReduce
+
+
+
+__global__ static void MaxReduce( const float* __restrict__ value, MatrixShape shape,
+                                  float* result, int r_stride,
+                                  float* index, int i_stride ) {
+    extern __shared__ float buffer[];   // length is blockDim.x
+    int* ibuffer = (int*)(buffer + blockDim.x);
+
+    buffer[threadIdx.x] = FLT_MIN;
+    ibuffer[threadIdx.x] = threadIdx.x;
+    const float* bor = value + blockIdx.x * shape.stride;
+
+    for ( int i = threadIdx.x; i < shape.column; i += blockDim.x ) {
+        if ( bor[i] > buffer[threadIdx.x] ) {
+            buffer[threadIdx.x] = bor[i];
+            ibuffer[threadIdx.x] = i;
+        }
+    }
+    __syncthreads();
+
+    if ( blockDim.x >= 512 ) {
+        if ( threadIdx.x < 256 ) {
+            if ( buffer[threadIdx.x + 256] > buffer[threadIdx.x] ) {
+                buffer[threadIdx.x] = buffer[threadIdx.x + 256];
+                ibuffer[threadIdx.x] = ibuffer[threadIdx.x + 256];
+            }
+        }
+        __syncthreads();
+    }
+
+    if ( blockDim.x >= 256 ) {
+        if ( threadIdx.x < 128 ) {
+            if ( buffer[threadIdx.x + 128] > buffer[threadIdx.x] ) {
+                buffer[threadIdx.x] = buffer[threadIdx.x + 128];
+                ibuffer[threadIdx.x] = ibuffer[threadIdx.x + 128];
+            }
+        }
+        __syncthreads();
+    } 
+
+    if ( blockDim.x >= 128 ) {
+        if ( threadIdx.x < 64 ) {
+            if ( buffer[threadIdx.x + 64] > buffer[threadIdx.x] ) {
+                buffer[threadIdx.x] = buffer[threadIdx.x + 64];
+                ibuffer[threadIdx.x] = ibuffer[threadIdx.x + 64];
+            }
+        }
+        __syncthreads();
+    } 
+
+    if ( blockDim.x >= 64 && threadIdx.x < 32 ) {
+        if ( buffer[threadIdx.x + 32] > buffer[threadIdx.x] ) {
+            buffer[threadIdx.x] = buffer[threadIdx.x + 32];
+            ibuffer[threadIdx.x] = ibuffer[threadIdx.x + 32];
+        }
+    }
+    if ( blockDim.x >= 32 && threadIdx.x < 16 ) {
+        if ( buffer[threadIdx.x + 16] > buffer[threadIdx.x] ) {
+            buffer[threadIdx.x] = buffer[threadIdx.x + 16];
+            ibuffer[threadIdx.x] = ibuffer[threadIdx.x + 16];
+        }
+    }
+    if ( blockDim.x >= 16 && threadIdx.x < 8 ) {
+        if ( buffer[threadIdx.x + 8] > buffer[threadIdx.x] ) {
+            buffer[threadIdx.x] = buffer[threadIdx.x + 8];
+            ibuffer[threadIdx.x] = ibuffer[threadIdx.x + 8];
+        }
+    }
+    if ( blockDim.x >= 8 && threadIdx.x < 4 ) {
+        if ( buffer[threadIdx.x + 4] > buffer[threadIdx.x] ) {
+            buffer[threadIdx.x] = buffer[threadIdx.x + 4];
+            ibuffer[threadIdx.x] = ibuffer[threadIdx.x + 4];
+        }
+    }
+    if ( blockDim.x >= 4 && threadIdx.x < 2 ) {
+        if ( buffer[threadIdx.x + 2] > buffer[threadIdx.x] ) {
+            buffer[threadIdx.x] = buffer[threadIdx.x + 2];
+            ibuffer[threadIdx.x] = ibuffer[threadIdx.x + 2];
+        }
+    }
+    if ( blockDim.x >= 2 && threadIdx.x < 1 ) {
+        if ( buffer[threadIdx.x + 1] > buffer[threadIdx.x] ) {
+            buffer[threadIdx.x] = buffer[threadIdx.x + 1];
+            ibuffer[threadIdx.x] = ibuffer[threadIdx.x + 1];
+        }
+    }
+
+    if ( threadIdx.x == 0 ) {
+        result[blockIdx.x * r_stride] = buffer[0];
+        index[blockIdx.x * i_stride] = (float)ibuffer[0];
+    }
+}   // end of MaxReduce
+
+
+
+__global__ static void MinReduce( const float* __restrict__ value, MatrixShape shape,
+                                  float* result, int stride ) {
+    extern __shared__ float buffer[];   // length is blockDim.x
+
+    buffer[threadIdx.x] = FLT_MAX;
+    const float* bor = value + blockIdx.x * shape.stride;
+
+    for ( int i = threadIdx.x; i < shape.column; i += blockDim.x ) {
+        buffer[threadIdx.x] = fminf(buffer[threadIdx.x], bor[i]);
+    }
+    __syncthreads();
+
+    if ( blockDim.x >= 512 ) {
+        if ( threadIdx.x < 256 ) {
+            buffer[threadIdx.x] = fminf(buffer[threadIdx.x], buffer[threadIdx.x + 256]);
+        }
+        __syncthreads();
+    }
+
+    if ( blockDim.x >= 256 ) {
+        if ( threadIdx.x < 128 ) {
+            buffer[threadIdx.x] = fminf(buffer[threadIdx.x], buffer[threadIdx.x + 128]);
+        }
+        __syncthreads();
+    } 
+
+    if ( blockDim.x >= 128 ) {
+        if ( threadIdx.x < 64 ) {
+            buffer[threadIdx.x] = fminf(buffer[threadIdx.x], buffer[threadIdx.x + 64]);
+        }
+        __syncthreads();
+    } 
+
+    if ( threadIdx.x < 32 ) {
+        if ( blockDim.x >= 64 ) {
+            buffer[threadIdx.x] = fminf(buffer[threadIdx.x], buffer[threadIdx.x + 32]);
+        }
+        if ( blockDim.x >= 32 ) {
+            buffer[threadIdx.x] = fminf(buffer[threadIdx.x], buffer[threadIdx.x + 16]);
+        }
+        if ( blockDim.x >= 16 ) {
+            buffer[threadIdx.x] = fminf(buffer[threadIdx.x], buffer[threadIdx.x + 8]);
+        }
+        if ( blockDim.x >= 8 ) {
+            buffer[threadIdx.x] = fminf(buffer[threadIdx.x], buffer[threadIdx.x + 4]);
+        }
+        if ( blockDim.x >= 4 ) {
+            buffer[threadIdx.x] = fminf(buffer[threadIdx.x], buffer[threadIdx.x + 2]);
+        }
+        if ( blockDim.x >= 2 ) {
+            buffer[threadIdx.x] = fminf(buffer[threadIdx.x], buffer[threadIdx.x + 1]);
+        }
+    }
+
+    if ( threadIdx.x == 0 ) {
+        result[blockIdx.x * stride] = buffer[0];
+    }
+}   // end of MinReduce
+
 
 
 __global__ static void DiffXent( float* value, MatrixShape shape, 
@@ -133,6 +500,7 @@ __global__ static void ComputeVfsmnHiddenDiff( const float* memoryDiff, MatrixSh
 }   // end of UpdateVfsmnFilter
 
 
+// template <FunctionType type>
 __global__ static void UpdateVfsmnFilter( const float* memoryDiff, MatrixShape mdShape,
                                           const float* position, int stride,
                                           const float* hidden, MatrixShape hShape,
@@ -150,7 +518,7 @@ __global__ static void UpdateVfsmnFilter( const float* memoryDiff, MatrixShape m
     }
 }   // end of UpdateVfsmnFilter
 
-
+/*
 __global__ static void ArgMax( const float* value, MatrixShape shape, 
                                float* index, int stride ) {
     int i = threadIdx.x + blockIdx.x * blockDim.x;
@@ -166,7 +534,7 @@ __global__ static void ArgMax( const float* value, MatrixShape shape,
         }
         index[i * stride] = (float) maxIdx;
     }
-}   // end of ArgMax
+}   // end of ArgMax    */
 
 
 __global__ static void LookUp( const float* value, MatrixShape shape, 
@@ -188,20 +556,20 @@ __global__ static void Kernel( const float* inP, MatrixShape inShape,
     if ( r < outShape.row && c < outShape.column ) {
         int srcIdx = r * inShape.stride + c;
         int dstIdx = r * outShape.stride + c;
+        float __result = 0.0f;
         switch ( type ) {
             case kRelu:
                 outP[dstIdx] = fmaxf( 0.0f, inP[srcIdx] );
                 break;
                 
             case kExp: // clip it/ceiling
-                outP[dstIdx] = expf( inP[srcIdx] );
+                __result = inP[srcIdx] ;
+                outP[dstIdx] = expf(__result > 81.0f ? 81.0f: __result)  ;
                 break;
                 
             case kReciprocal:
-            #ifdef DEBUG
-                assert( inP[srcIdx] != 0.0f );
-            #endif
-                outP[dstIdx] = 1.0f / inP[srcIdx];
+                __result = inP[srcIdx];
+                outP[dstIdx]  = 1.0f /  (__result < 1e-32 ? 1e-32: __result);
                 break;
                 
             case kSigmoid:
@@ -221,8 +589,8 @@ __global__ static void Kernel( const float* inP, MatrixShape inShape,
                 break;
 
             case kLog:
-                float __out = logf(inP[srcIdx]);
-                outP[dstIdx] = (isnan(__out) || isinf(__out)) ? -77.0f : __out;
+                __result = inP[srcIdx]  ;
+                outP[dstIdx] = logf(__result < 1e-32 ? 1e-32 : __result)  ;
                 break;
         }   // end of case
     }   // end of if
@@ -415,6 +783,139 @@ template __global__ void Kernel< kAddColumns> ( const float* src, MatrixShape sr
 
 // ==========================================================================================
 
+// TODO: make sure SparseMatrix and Matrix are on the same GPU
+
+cusparseHandle_t SparseMatrix::handle = NULL;
+cusparseMatDescr_t SparseMatrix::descriptor = NULL;
+int SparseMatrix::n_matrix = 0;
+Matrix* SparseMatrix::buffer = NULL;
+
+
+SparseMatrix::SparseMatrix() :
+        m_nnz( 0 ), 
+        m_n_row( 0 ), 
+        m_n_column( 0 ),
+        m_data( NULL ),
+        m_indices( NULL ),
+        m_indptr( NULL ),
+        m_n_byte( 0 )    {
+    if ( 0 == SparseMatrix::n_matrix ) {
+        SparseMatrix::buffer = new Matrix( 16, 16 );
+        CUSPARSE_CHECK( cusparseCreate( &SparseMatrix::handle ), 
+                        "cusparseCreate" );
+        CUSPARSE_CHECK( cusparseCreateMatDescr( &SparseMatrix::descriptor ),
+                        "cusparseCreateMatDescr" ) ; 
+        CUSPARSE_CHECK( cusparseSetMatType( SparseMatrix::descriptor, 
+                                            CUSPARSE_MATRIX_TYPE_GENERAL ),
+                        "cusparseSetMatType" );
+        CUSPARSE_CHECK( cusparseSetMatIndexBase( SparseMatrix::descriptor, 
+                                                 CUSPARSE_INDEX_BASE_ZERO ),
+                        "cusparseSetMatIndexBase" );
+    }
+    SparseMatrix::n_matrix++;
+    ASSERT( NULL == m_data );
+    ASSERT( NULL == m_indices );
+    ASSERT( NULL == m_indptr );
+}    // end of SparseMatrix
+
+
+SparseMatrix::SparseMatrix( const vector<float>& data, 
+                            const vector<int>& indices, 
+                            const vector<int>& indptr,
+                            int n_column ) : 
+        m_data( NULL ),
+        m_indices( NULL ),
+        m_indptr( NULL),
+        m_n_byte( 0 )    { 
+    if ( 0 == SparseMatrix::n_matrix ) {
+        SparseMatrix::buffer = new Matrix( 16, 16 );
+        CUSPARSE_CHECK( cusparseCreate( &SparseMatrix::handle ), 
+                        "cusparseCreate" );
+        CUSPARSE_CHECK( cusparseCreateMatDescr( &SparseMatrix::descriptor ),
+                        "cusparseCreateMatDescr" ) ; 
+        CUSPARSE_CHECK( cusparseSetMatType( SparseMatrix::descriptor, 
+                                            CUSPARSE_MATRIX_TYPE_GENERAL ),
+                        "cusparseSetMatType" );
+        CUSPARSE_CHECK( cusparseSetMatIndexBase( SparseMatrix::descriptor, 
+                                                 CUSPARSE_INDEX_BASE_ZERO ),
+                        "cusparseSetMatIndexBase" );
+    }
+    SetData( data, indices, indptr );
+    SparseMatrix::n_matrix++;
+}    // end of SparseMatrix
+
+
+SparseMatrix::~SparseMatrix() {
+    if ( NULL != m_data ) {
+        CUDA_CHECK( cudaFree( m_data ), "cudaFree" );
+        m_data = NULL;
+        m_indices = NULL;
+        m_indptr = NULL;
+    }
+    
+    SparseMatrix::n_matrix--;
+    if ( 0 == SparseMatrix::n_matrix ) {
+        delete SparseMatrix::buffer;
+        SparseMatrix::buffer = NULL;
+        CUSPARSE_CHECK( cusparseDestroyMatDescr( SparseMatrix::descriptor ),
+                        "cusparseDestroyMatDescr" ); 
+        SparseMatrix::descriptor = NULL;
+        CUSPARSE_CHECK( cusparseDestroy( SparseMatrix::handle ),
+                        "cusparseDestroy" );
+        SparseMatrix::handle = NULL;
+    }
+}    // end of ~SparseMatrix        
+
+
+void SparseMatrix::SetData( const vector<float>& data, 
+                            const vector<int>& indices, 
+                            const vector<int>& indptr,
+                            int n_column ) {
+    m_nnz = data.size();
+    m_n_row = indptr.size() - 1;
+    ASSERT( m_nnz == indices.size() );
+    ASSERT( m_nnz == indptr.back() );
+    ASSERT( indptr.size() > 0 && indptr[0] == 0 );
+    
+    m_n_column = max( *max_element( indices.begin(), indices.end() ) + 1, n_column );
+
+    int total_size = sizeof(float) * m_nnz
+                    + sizeof(float) * m_nnz
+                    + sizeof(int) * indptr.size();
+    void* buffer = operator new( total_size );
+    if ( m_nnz > 0 ) {
+        memcpy( buffer, &data[0], sizeof(float) * m_nnz );
+        memcpy( (float*)buffer + m_nnz, &indices[0], sizeof(int) * m_nnz );
+    }
+    memcpy( (int*)((float*)buffer + m_nnz) + m_nnz, 
+            &indptr[0], 
+            sizeof(int) * indptr.size() );
+    
+    if ( NULL != m_data && total_size > m_n_byte ) {
+        CUDA_CHECK( cudaFree( m_data ), "cudaFree" );
+        m_data = NULL;
+    }
+
+    if ( NULL == m_data ) {
+        CUDA_CHECK( cudaMalloc( (void**)&m_data, total_size ), "cudaMalloc" );
+        m_n_byte = total_size;
+    }
+    
+    CUDA_CHECK( cudaMemcpy( m_data, 
+                            buffer, 
+                            total_size, 
+                            cudaMemcpyHostToDevice ), 
+                "cudaMemcpy" );
+
+    m_indices = (int*)(m_data + m_nnz);
+    m_indptr = m_indices + m_nnz;
+
+    operator delete( buffer );
+}    // end of SetData
+
+                
+
+// ==========================================================================================
 
 float* MatrixBase::ones = NULL;
 float* MatrixBase::zeros = NULL;
@@ -423,6 +924,11 @@ int MatrixBase::buffer_size = 0;
 int MatrixBase::n_matrix = 0;
 cublasHandle_t MatrixBase::handle = NULL;
 curandGenerator_t MatrixBase::generator = NULL;
+cudaStream_t MatrixBase::stream = 0;
+
+#ifdef XT
+    cublasXtHandle_t MatrixBase::xt_handle = NULL;
+#endif
 
 
 bool MatrixBase::ValidateRange( MatrixRange range ) const  {
@@ -463,6 +969,20 @@ void MatrixBase::SetData( const vector<float>& data ) {
 }   // end of SetData
 
 
+void MatrixBase::SetDataAsync( const vector<float>& data ) {
+    ASSERT( data.size() == m_n_row * m_n_column );
+    CUDA_CHECK( cudaMemcpy2DAsync( m_data,
+                                   m_n_stride * sizeof(float),
+                                   &data[0],
+                                   m_n_column * sizeof(float),
+                                   m_n_column * sizeof(float),
+                                   m_n_row,
+                                   cudaMemcpyHostToDevice,
+                                   MatrixBase::stream ),
+                "cudaMemcpy2D" );
+}   // end of SetData
+
+
 
 string MatrixBase::ToString() const {
     vector<float> buffer;
@@ -494,6 +1014,26 @@ MatrixShape MatrixBase::Shape() const {
 void MatrixBase::Sgemm( float beta, float alpha,
             const MatrixBase& A, cublasOperation_t transa,
             const MatrixBase& B, cublasOperation_t transb ) {
+#ifdef XT
+    // TODO: during backpropagation, this function gives segmentation fault
+    //       However, all data transfer from these three matrices to host memory 
+    //       don't hit any error:(
+    CUBLAS_CHECK( cublasXtSgemm( MatrixBase::xt_handle,
+                                   transb,
+                                   transa,
+                                   m_n_column,
+                                   m_n_row,
+                                   (transb == CUBLAS_OP_N ? B.m_n_row : B.m_n_column),
+                                   &alpha,
+                                   B.m_data,
+                                   B.m_n_stride,
+                                   A.m_data,
+                                   A.m_n_stride,
+                                   &beta,
+                                   m_data,
+                                   m_n_stride ),
+                  "cublasXtSgemm" );
+#else
     CUBLAS_CHECK( cublasSgemm( MatrixBase::handle,
                                transb,
                                transa,
@@ -509,7 +1049,95 @@ void MatrixBase::Sgemm( float beta, float alpha,
                                m_data,
                                m_n_stride ), 
                   "cublasSgemm" );
+#endif
 }   // end of Sgemm
+
+
+void MatrixBase::Sgemm( float beta, float alpha,
+                        const MatrixBase& A, cusparseOperation_t transa,
+                        const SparseMatrix& B, cusparseOperation_t transb ) {
+    CUSPARSE_CHECK( cusparseScsrmm2( SparseMatrix::handle,
+                                     (transb == CUSPARSE_OPERATION_NON_TRANSPOSE ?
+                                        CUSPARSE_OPERATION_TRANSPOSE : 
+                                        CUSPARSE_OPERATION_NON_TRANSPOSE),
+                                     transa,
+                                     m_n_column,
+                                     m_n_row,
+                                     (transb == CUSPARSE_OPERATION_NON_TRANSPOSE ? 
+                                                    B.m_n_column : B.m_n_row),
+                                     B.m_nnz,
+                                     &alpha,
+                                     SparseMatrix::descriptor,
+                                     B.m_data,
+                                     B.m_indptr,
+                                     B.m_indices,
+                                     A.m_data,
+                                     A.m_n_stride,
+                                     &beta,
+                                     m_data,
+                                     m_n_stride ), 
+                    "cusparseScsrmm2" );
+    CUDA_CHECK( cudaDeviceSynchronize(), "cudaDeviceSynchronize" );
+}    // end of Sgemm
+
+
+void MatrixBase::Sgemm( float beta, float alpha,
+                        const SparseMatrix& A, cusparseOperation_t transa,
+                        const MatrixBase& B, cusparseOperation_t transb ) {
+    SparseMatrix::buffer->Reshape( m_n_column, m_n_row );
+    SparseMatrix::buffer->Sgemm( 0.0f, 1.0f,
+                                 B, ( transa == CUSPARSE_OPERATION_TRANSPOSE ? 
+                                        CUSPARSE_OPERATION_NON_TRANSPOSE : 
+                                        CUSPARSE_OPERATION_TRANSPOSE ),
+                                 A, ( transa == CUSPARSE_OPERATION_TRANSPOSE ? 
+                                        CUSPARSE_OPERATION_NON_TRANSPOSE : 
+                                        CUSPARSE_OPERATION_TRANSPOSE ) );
+    this->Add( beta, alpha, *SparseMatrix::buffer, CUBLAS_OP_T );
+}   // end of Sgemm
+
+
+void MatrixBase::Strmm( float alpha,
+                        const MatrixBase& A, 
+                        cublasSideMode_t side, 
+                        cublasFillMode_t uplo,
+                        const MatrixBase& B, 
+                        cublasOperation_t trans ) {
+    if ( side == CUBLAS_SIDE_LEFT ) {
+        side = CUBLAS_SIDE_RIGHT;
+    }
+    else if ( side == CUBLAS_SIDE_RIGHT ) {
+        side = CUBLAS_SIDE_LEFT;
+    }
+    else {
+        ASSERT( false );
+    }
+
+    if ( uplo == CUBLAS_FILL_MODE_LOWER ) {
+        uplo = CUBLAS_FILL_MODE_UPPER;
+    }
+    else if ( uplo == CUBLAS_FILL_MODE_UPPER ) {
+        uplo = CUBLAS_FILL_MODE_LOWER;
+    }
+    else {
+        ASSERT( false );
+    }
+
+    CUBLAS_CHECK( cublasStrmm( MatrixBase::handle,
+                               side,
+                               uplo,
+                               trans,
+                               CUBLAS_DIAG_NON_UNIT,
+                               m_n_column,
+                               m_n_row,
+                               &alpha,
+                               A.m_data,
+                               A.m_n_stride,
+                               B.m_data,
+                               B.m_n_stride,
+                               m_data,
+                               m_n_stride ), 
+                  "cublasStrmm()" );
+}
 
 
 
@@ -647,9 +1275,60 @@ void MatrixBase::Exp( const MatrixBase& value ) {
 
 void MatrixBase::Softmax( const MatrixBase& value ) {
     const float ONE = 1.0f;
+    const float MINUS_ONE = -1.0f;
     const float ZERO = 0.0f;
 
-    Exp( value );
+    int __grid = value.m_n_row;
+    int __block = closest2Power( value.m_n_column );
+    if ( __block > 512 ) {
+        __block = 512;
+    }
+    int __nByte = sizeof(float) * __block;
+
+    ::MaxReduce<<<__grid, __block, __nByte>>>( value.m_data, 
+                                               value.Shape(), 
+                                               MatrixBase::buffer, 
+                                               1 );
+    KERNEL_CHECK( __PRETTY_FUNCTION__ );
+
+    Copy( value );
+
+#ifdef XT
+    CUBLAS_CHECK( cublasXtSgemm( MatrixBase::xt_handle,
+                                   CUBLAS_OP_N,
+                                   CUBLAS_OP_N,
+                                   m_n_column,
+                                   m_n_row,
+                                   1,
+                                   &MINUS_ONE,
+                                   MatrixBase::ones,
+                                   m_n_column,
+                                   MatrixBase::buffer,
+                                   1,
+                                   &ONE,
+                                   m_data,
+                                   m_n_stride ), 
+                  "cublasXtSgemm" );
+    CUDA_CHECK( cudaDeviceSynchronize(), "cudaDeviceSynchronize" );
+#else
+    CUBLAS_CHECK( cublasSgemm( MatrixBase::handle,
+                               CUBLAS_OP_N,
+                               CUBLAS_OP_N,
+                               m_n_column,
+                               m_n_row,
+                               1,
+                               &MINUS_ONE,
+                               MatrixBase::ones,
+                               m_n_column,
+                               MatrixBase::buffer,
+                               1,
+                               &ONE,
+                               m_data,
+                               m_n_stride ), 
+                  "cublasSgemm" );
+#endif
+
+    Exp( *this );
 
     CUBLAS_CHECK( cublasSgemv( MatrixBase::handle,
                                CUBLAS_OP_T,
@@ -781,9 +1460,6 @@ void MatrixBase::DiffXent( const MatrixBase& value, const MatrixBase& target ) {
 
 
 
-
-
-
 void MatrixBase::Random( float lower, float upper ) {
     int actualSize = m_n_row * m_n_column;
     float* deviceP = NULL;
@@ -795,6 +1471,7 @@ void MatrixBase::Random( float lower, float upper ) {
     else {
         deviceP = MatrixBase::buffer;
     }
+
 
     CURAND_CHECK( curandGenerateUniform( MatrixBase::generator, deviceP, actualSize ),
                   "curandGenerateUniform" );
@@ -859,6 +1536,39 @@ void MatrixBase::SumRowsOf( const MatrixBase& matrix, float beta, float alpha ) 
                                m_data,
                                1 ),
                   "cublasSgemv" );
+}
+
+
+
+void MatrixBase::Add( float alpha, const MatrixBase& other ) {
+    ASSERT( other.m_n_row == 1 && other.m_n_column == m_n_column || 
+            other.m_n_column == 1 && other.m_n_row == m_n_row );
+    if ( other.m_n_row == 1 ) {
+        CUBLAS_CHECK( cublasSger( MatrixBase::handle,
+                                  m_n_column,
+                                  m_n_row,
+                                  &alpha,
+                                  other.m_data,
+                                  1,
+                                  MatrixBase::ones,
+                                  1,
+                                  m_data,
+                                  m_n_stride ), 
+                      "cublasSger" );
+    }
+    else {
+        CUBLAS_CHECK( cublasSger( MatrixBase::handle,
+                                  m_n_column,
+                                  m_n_row,
+                                  &alpha,
+                                  MatrixBase::ones,
+                                  1,
+                                  other.m_data,
+                                  other.m_n_stride,
+                                  m_data,
+                                  m_n_stride ), 
+                      "cublasSger" );
+    }
 }
 
 
@@ -940,7 +1650,7 @@ void MatrixBase::Copy( const MatrixBase& other ) {
 }
 
 
-void MatrixBase::ArgMax( const MatrixBase& value ) {
+void MatrixBase::ArgMax( const MatrixBase& value ) {/*
     ASSERT( m_n_row == 1 || m_n_column == 1 );
     if ( m_n_row == 1 ) {
         ASSERT( m_n_column == value.m_n_row );
@@ -955,6 +1665,20 @@ void MatrixBase::ArgMax( const MatrixBase& value ) {
                                value.Shape(), 
                                m_data, 
                                m_n_row == 1 ? 1 : m_n_stride );
+    KERNEL_CHECK( __PRETTY_FUNCTION__ );*/
+
+    ASSERT( m_n_column == 2 || m_n_column == 1 );
+    int grid = m_n_row;
+    int block = closest2Power( m_n_column );
+    if ( block > 512 ) {
+        block = 512;
+    }
+    int nByte = sizeof(float) * block + sizeof(int) * block;
+
+    ::MaxReduce<<<grid, block, nByte>>>( value.m_data, value.Shape(), 
+                                         (m_n_column == 2 ? m_data + 1 : MatrixBase::buffer), 
+                                         (m_n_column == 2 ? m_n_stride : 1),
+                                         m_data, m_n_stride );
     KERNEL_CHECK( __PRETTY_FUNCTION__ );
 }
 
@@ -1016,7 +1740,7 @@ float MatrixBase::Xent( const MatrixBase& index ) const {
     KERNEL_CHECK( __PRETTY_FUNCTION__ );
 
     thrust::device_ptr<float> buffer = thrust::device_pointer_cast( MatrixBase::buffer ); 
-    float result = thrust::reduce( buffer, buffer + m_n_row );
+    float result = thrust::reduce( buffer, buffer + m_n_row, 0.0f, thrust::plus<float>() );
 
     return -result;
 }
@@ -1118,103 +1842,64 @@ bool MatrixBase::HasNanOrInf() {
 
 
 float MatrixBase::Min() {
-    float* __buffer = NULL;
-    int __size = m_n_row * m_n_column;
-    if ( MatrixBase::buffer_size < __size ) {
-        CUDA_CHECK( cudaMalloc( (void**)&__buffer, sizeof(float) * __size ), "cudaMalloc" );
+    int grid = m_n_row;
+    int block = closest2Power( m_n_column );
+    if ( block > 512 ) {
+        block = 512;
     }
-    else {
-        __buffer = MatrixBase::buffer;
-    }
+    int nByte = sizeof(float) * block;
 
-    CUDA_CHECK( cudaMemcpy2D( __buffer,
-                              m_n_column * sizeof(float),
-                              m_data,
-                              m_n_stride * sizeof(float),
-                              m_n_column * sizeof(float),
-                              m_n_row,
-                              cudaMemcpyDeviceToDevice ),
-                "cudaMemcpy2D" );
+    ::MinReduce<<<grid, block, nByte>>>( m_data, Shape(), MatrixBase::buffer, 1 );
+    KERNEL_CHECK( __PRETTY_FUNCTION__ );
 
-    thrust::device_ptr<float> deviceP = thrust::device_pointer_cast( __buffer );
+    thrust::device_ptr<float> deviceP = thrust::device_pointer_cast( MatrixBase::buffer );
 
     float result = thrust::reduce( deviceP, 
-                                  deviceP + __size, 
-                                  numeric_limits<float>::max(),
-                                  thrust::minimum<float>() );
-
-    if ( MatrixBase::buffer_size < __size ) {
-        CUDA_CHECK( cudaFree( __buffer ), "cudaFree" );
-    }
-
+                                   deviceP + m_n_row, 
+                                   numeric_limits<float>::max(),
+                                   thrust::minimum<float>() );
     return result;
 }
 
 
 float MatrixBase::Max() {
-    float* __buffer = NULL;
-    int __size = m_n_row * m_n_column;
-    if ( MatrixBase::buffer_size < __size ) {
-        CUDA_CHECK( cudaMalloc( (void**)&__buffer, sizeof(float) * __size ), "cudaMalloc" );
+    int grid = m_n_row;
+    int block = closest2Power( m_n_column );
+    if ( block > 512 ) {
+        block = 512;
     }
-    else {
-        __buffer = MatrixBase::buffer;
-    }
+    int nByte = sizeof(float) * block;
 
-    CUDA_CHECK( cudaMemcpy2D( __buffer,
-                              m_n_column * sizeof(float),
-                              m_data,
-                              m_n_stride * sizeof(float),
-                              m_n_column * sizeof(float),
-                              m_n_row,
-                              cudaMemcpyDeviceToDevice ),
-                "cudaMemcpy2D" );
+    ::MaxReduce<<<grid, block, nByte>>>( m_data, Shape(), MatrixBase::buffer, 1 );
+    KERNEL_CHECK( __PRETTY_FUNCTION__ );
 
-    thrust::device_ptr<float> deviceP = thrust::device_pointer_cast( __buffer );
+    thrust::device_ptr<float> deviceP = thrust::device_pointer_cast( MatrixBase::buffer );
 
     float result = thrust::reduce( deviceP, 
-                                  deviceP + __size, 
-                                  numeric_limits<float>::min(),
-                                  thrust::maximum<float>() );
-
-    if ( MatrixBase::buffer_size < __size ) {
-        CUDA_CHECK( cudaFree( __buffer ), "cudaFree" );
-    }
-
+                                   deviceP + m_n_row, 
+                                   numeric_limits<float>::min(),
+                                   thrust::maximum<float>() );
     return result;
 }
 
 
 float MatrixBase::Sum() {
-    float* __buffer = NULL;
-    int __size = m_n_row * m_n_column;
-    if ( MatrixBase::buffer_size < __size ) {
-        CUDA_CHECK( cudaMalloc( (void**)&__buffer, sizeof(float) * __size ), "cudaMalloc" );
+    int grid = m_n_row;
+    int block = closest2Power( m_n_column );
+    if ( block > 512 ) {
+        block = 512;
     }
-    else {
-        __buffer = MatrixBase::buffer;
-    }
+    int nByte = sizeof(float) * block;
 
-    CUDA_CHECK( cudaMemcpy2D( __buffer,
-                              m_n_column * sizeof(float),
-                              m_data,
-                              m_n_stride * sizeof(float),
-                              m_n_column * sizeof(float),
-                              m_n_row,
-                              cudaMemcpyDeviceToDevice ),
-                "cudaMemcpy2D" );
+    ::SumReduce<<<grid, block, nByte>>>( m_data, Shape(), MatrixBase::buffer, 1 );
+    KERNEL_CHECK( __PRETTY_FUNCTION__ );
 
-    thrust::device_ptr<float> deviceP = thrust::device_pointer_cast( __buffer );
+    thrust::device_ptr<float> deviceP = thrust::device_pointer_cast( MatrixBase::buffer );
 
     float result = thrust::reduce( deviceP, 
-                                  deviceP + __size, 
-                                  0.0f,
-                                  thrust::plus<float>() );
-
-    if ( MatrixBase::buffer_size < __size ) {
-        CUDA_CHECK( cudaFree( __buffer ), "cudaFree" );
-    }
-
+                                   deviceP + m_n_row, 
+                                   0.0f,
+                                   thrust::plus<float>() );
     return result;
 }
 
@@ -1271,6 +1956,64 @@ void MatrixBase::UpdateVfsmnFilter( const MatrixBase& memoryDiff,
     KERNEL_CHECK( __PRETTY_FUNCTION__ );
 }
 
+
+void MatrixBase::m_clear_buffer() {
+    if ( MatrixBase::buffer != NULL && MatrixBase::buffer_size > 0 ) {
+        thrust::device_ptr<float> deviceP = thrust::device_pointer_cast( MatrixBase::buffer );
+        thrust::fill( deviceP, deviceP + MatrixBase::buffer_size, 0.0f );
+    }
+}    // end of m_clear_buffer
+
+
+float MatrixBase::L2Norm() {
+    int grid = m_n_row;
+    int block = closest2Power( m_n_column );
+    if ( block > 512 ) {
+        block = 512;
+    }
+    int nByte = sizeof(float) * block;
+
+    ::L2Norm<<<grid, block, nByte>>>( m_data, Shape(), MatrixBase::buffer, 1 );
+    KERNEL_CHECK( __PRETTY_FUNCTION__ );
+
+    thrust::device_ptr<float> deviceP = thrust::device_pointer_cast( MatrixBase::buffer );
+
+    float result = thrust::reduce( deviceP, 
+                                   deviceP + m_n_row, 
+                                   0.0f,
+                                   thrust::plus<float>() );
+    return sqrt(result);
+}    // end of L2Norm
+
+
+void MatrixBase::Clip( float lower, float upper ) {
+    ASSERT( lower < upper );
+    dim3 block( CU2DBLOCK, CU2DBLOCK );
+    dim3 grid( GridDim(m_n_row, CU2DBLOCK), GridDim(m_n_column, CU2DBLOCK) );
+    ::Clip<<<grid, block>>>( m_data, Shape(), lower, upper );
+    KERNEL_CHECK( __PRETTY_FUNCTION__ );
+}   // end of Clip
+
+
+void MatrixBase::Sparse2Dense( const SparseMatrix& other ) {
+    ASSERT( m_n_row == other.m_n_row && m_n_column == other.m_n_column );
+    
+    // SparseMatrix is in CSR, but MatrixBase is row-major. 
+    // cusparseScsr2dense is used instead.
+    CUSPARSE_CHECK( cusparseScsc2dense( SparseMatrix::handle,
+                                        m_n_column,
+                                        m_n_row,
+                                        SparseMatrix::descriptor,
+                                        other.m_data,
+                                        other.m_indices,
+                                        other.m_indptr,
+                                        m_data,
+                                        m_n_stride ), 
+                    "cusparseScsc2dense" );
+    CUDA_CHECK( cudaDeviceSynchronize(), "cudaDeviceSynchronize" );
+}    // end of SparseToDense
+
+
 // ==========================================================================================
 
 Matrix::Matrix() {
@@ -1303,6 +2046,37 @@ Matrix::Matrix() {
                       "curandCreateGenerator" );
         CURAND_CHECK( curandSetPseudoRandomGeneratorSeed( MatrixBase::generator, time(NULL) ), 
                       "curandSetPseudoRandomGeneratorSeed" );
+        CUDA_CHECK( cudaStreamCreate( &MatrixBase::stream), "cudaStreamCreate" );
+
+    #ifdef XT
+        int device[] = {0, 1};
+        CUBLAS_CHECK( cublasXtCreate( &MatrixBase::xt_handle ), "cublasXtCreate" );
+        CUBLAS_CHECK( cublasXtDeviceSelect( MatrixBase::xt_handle, 2, device ),
+                      "cublasXtDeviceSelect" );
+        CUDA_CHECK( cudaGetDevice( &bestChoice ), "cudaGetDevice" );
+        cout << CurrentTime() << ") cublasXT is enabled. " 
+             << bestChoice << " is the primary device." << endl;
+    #endif
+
+    #ifdef MULTIPLE
+        int canAccess = 0;
+        CUDA_CHECK( cudaDeviceCanAccessPeer( &canAccess, 0, 1 ), "cudaDeviceCanAccessPeer");
+        cout << CurrentTime() << ") Device 0 " << (canAccess ? "can" : "cannot")
+             << " access Device 1" << endl;
+        if ( canAccess ) {
+            CUDA_CHECK( cudaSetDevice(0), "cudaSetDevice" );
+            CUDA_CHECK( cudaDeviceEnablePeerAccess(1, 0), "cudaDeviceEnablePeerAccess" );
+        }
+        CUDA_CHECK( cudaDeviceCanAccessPeer( &canAccess, 1, 0 ), "cudaDeviceCanAccessPeer");
+        cout << CurrentTime() << ") Device 1 " << (canAccess ? "can" : "cannot")
+             << " access Device 0" << endl;
+        if ( canAccess ) {
+            CUDA_CHECK( cudaSetDevice(1), "cudaSetDevice" );
+            CUDA_CHECK( cudaDeviceEnablePeerAccess(0, 0), "cudaDeviceEnablePeerAccess" );
+        }
+
+        CUDA_CHECK( cudaSetDevice( bestChoice ), "cudaSetDevice" );
+    #endif 
     }
     MatrixBase::n_matrix++;
     ASSERT( NULL == m_data );
@@ -1339,6 +2113,10 @@ Matrix::Matrix( int n_row, int n_column, FunctionType type ) {
                       "curandCreateGenerator" );
         CURAND_CHECK( curandSetPseudoRandomGeneratorSeed( MatrixBase::generator, time(NULL) ), 
                       "curandSetPseudoRandomGeneratorSeed" );
+
+    #ifdef XT
+        CUBLAS_CHECK( cublasXtDestroy( MatrixBase::xt_handle ), "cublasXtDestroy" );
+    #endif 
     }
     Reshape( n_row, n_column, type );
     MatrixBase::n_matrix++;
@@ -1434,6 +2212,8 @@ void Matrix::Reshape( int row, int column, FunctionType type ) {
         CUDA_CHECK( cudaMalloc( (void**)&MatrixBase::buffer, 
                                 sizeof(float) * MatrixBase::buffer_size ), 
                     "cudaMalloc" );
+        thrust::device_ptr<float> __buffer = thrust::device_pointer_cast( MatrixBase::buffer );
+        thrust::fill( __buffer, __buffer + MatrixBase::buffer_size, 0.0f );
     }
 }   // end of Resahpe
 
@@ -1489,92 +2269,83 @@ ostream& operator << ( ostream& out, const MatrixBase& matrix ) {
 
 #ifdef MATRIX_UNIT_TEST
 int main( int argc, char** argv ) {
-    Matrix gpu( 32, 32 );
-    gpu.Fill( -1.0 );
-    cout << gpu << endl;
+    const int NUM_ROWS = 16;
+    const int NUM_COLUMNS = 512;
 
-    vector<float> cpu(8 * 16);
-    for ( int i = 0; i < cpu.size(); i++ ) {
-        cpu[i] = i / 100.0f;
-        cpu[i] *= cpu[i];
-    }
-    SubMatrix sm1( gpu, MatrixRange(0, 8, 0, 16) );
-    sm1.SetData( cpu );
-    cout << gpu << endl;
-
-    SubMatrix sm2( gpu, MatrixRange(0, 8, 16, 32) );
-    sm2.Exp( sm1 );
-    cout << gpu << endl;
-
-    SubMatrix sm3( gpu, MatrixRange(8, 16, 0, 16) );
-    sm3.Softmax( sm1 );
-    cout << gpu << endl;
-
-    Matrix index( 9, 1 );
-    float idx[] = { 3, 7, 9, 7, 3, 4, 0, 7, 5 };
-    index.SetData( vector<float>( idx, idx + 9 ) );
-
-    SubMatrix sm4( gpu, MatrixRange(8, 17, 16, 32) );
-    sm4.GetRows( SubMatrix( gpu, MatrixRange(0, 32, 0, 16) ), index );
-    cout << gpu << endl;
-
-    SubMatrix sm5( gpu, MatrixRange( 24, 32, 0, 32 ) );
-    sm5.Random( -1.0f, 1.0f );
-    cout << gpu << endl;
-
-    // ======================================================================
-
-    vector<float> buffer( 49 * 321 );
-    for ( int i = 0; i < buffer.size(); i++ ) {
-        int r = i / 321;
-        int c = i % 321;
-        buffer[i] = (r + c) / 100.0f;
-    }
-
-    Matrix easy( 49, 321 );
-    easy.SetData( buffer );
-    cout << easy << endl;
-
-    Matrix large( 128, 512 );
-    SubMatrix row( large, MatrixRange( 1, 2, 0, 321 ) );
-    SubMatrix column( large, MatrixRange( 0, 49, 1, 2 ) );
-
-    row.SumRowsOf( easy );
-    cout << row << endl;
-
-    column.SumColumnsOf( easy );
-    cout << column << endl;
-
-    easy.Add( 0.0f, 1.0f, row );
-    cout << easy << endl;
-
-    easy.Add( 0.0f, 1.0f, column );
-    cout << easy << endl;
-
-    easy.Add( 0.0f, 1.0f, SubMatrix( row, MatrixRange( 0, 1, 0, 49) ), CUBLAS_OP_T );
-    cout << easy << endl;
-
-    // ======================================================================
-
-    Matrix nimeiG( 36, 128 );
-    vector<float> nimeiC( 36 * 128 );
-    for ( int i = 0; i < nimeiG.Rows(); i++ ) {
-        for ( int j = 0; j < nimeiG.Columns(); j++ ) {
-            nimeiC[i * nimeiG.Columns() + j] = j;
+    Matrix projection( NUM_COLUMNS, 128 );
+    projection.Random( -1.0f, 1.0f );
+    
+    vector<float> dense;
+    vector<float> data;
+    vector<int> indices;
+    vector<int> indptr( 1, 0 );
+    
+    for ( int r = 0; r < NUM_ROWS; r++ ) {
+        for ( int c = 0; c < NUM_COLUMNS; c++ ) {
+            if ( c % (r + 1) == 0 ) {
+                float candidate = (r + c / NUM_COLUMNS) / NUM_ROWS;
+                dense.push_back( candidate );
+                data.push_back( candidate );
+                indices.push_back( c );
+            }
+            else {
+                dense.push_back( 0.0f );
+            }
         }
+        indptr.push_back( data.size() );
     }
-    nimeiG.SetData( nimeiC );
-    cout << nimeiG << endl;
+    
+    Matrix dense_matrix( NUM_ROWS, NUM_COLUMNS );
+    dense_matrix.SetData( dense );
+    SparseMatrix sparse_matrix( data, indices, indptr, NUM_COLUMNS );
+    cout << CurrentTime() << ") constructors and SetData seem fine" << endl; 
+    
+    Matrix gpu_input( NUM_ROWS, NUM_COLUMNS );
+    gpu_input.Sparse2Dense( sparse_matrix );
+    cout << CurrentTime() << ") Sparse2Dense doesn't fail" << endl;
+    
+    vector<float> cpu_input;
+    gpu_input.GetData( &cpu_input );
+    int n_diff_byte = memcmp( &cpu_input[0], &dense[0], sizeof(float) * NUM_ROWS * NUM_COLUMNS );
+    cout << CurrentTime() << ") number of different bytes: " << n_diff_byte << endl;
+    if ( 0 == n_diff_byte ) {
+        cout << CurrentTime() << ") Sparse2Dense seems correct" << endl;
+    }
+    
+    Matrix gpu_out_from_sparse( NUM_ROWS, 128 );
+    Matrix gpu_out_from_dense( NUM_ROWS, 128 );
+    Matrix gpu_buffer( 128, NUM_ROWS );
+    
+    gpu_out_from_dense.Sgemm( 0.0f, 1.0f, 
+                              dense_matrix, CUBLAS_OP_N, 
+                              projection, CUBLAS_OP_N );
+    gpu_buffer.Sgemm( 0.0f, 1.0f,
+                      projection, CUSPARSE_OPERATION_TRANSPOSE,
+                      sparse_matrix, CUSPARSE_OPERATION_TRANSPOSE );
+    gpu_out_from_sparse.Add( 0.0f, 1.0f, gpu_buffer, CUBLAS_OP_T );
+    cout << CurrentTime() << ") SparseMatrix doesn't throw exception" << endl;
+    
+    vector<float> cpu_out_from_dense;
+    vector<float> cpu_out_from_sparse;
+    gpu_out_from_dense.GetData( &cpu_out_from_dense );
+    gpu_out_from_sparse.GetData( &cpu_out_from_sparse );
+    n_diff_byte = memcmp( &cpu_out_from_dense[0], &cpu_out_from_sparse[0],
+                          sizeof(float) * NUM_ROWS * 128 );
+    cout << CurrentTime() << ") number of different bytes " << n_diff_byte << endl;
+    if ( 0 == n_diff_byte ) {
+        cout << CurrentTime() << ") SparseMatrix::Sgemm seems correct" << endl;
+    }
 
-    index.Reshape( 9, 1 );
-    float qq[] = { 30, 70, 90, 70, 30, 40, 0, 70, 50};
-    index.SetData( vector<float>( qq, qq + sizeof(qq) / sizeof(float) ) );
-
-    Matrix phuck( 36, 9 );
-    phuck.GetColumns( nimeiG, index );
-    cout << phuck << endl;
-
-
+    gpu_out_from_dense.Sgemm( 0.0f, 1.0f, 
+                              sparse_matrix, CUSPARSE_OPERATION_NON_TRANSPOSE,
+                              projection, CUSPARSE_OPERATION_NON_TRANSPOSE );
+    gpu_out_from_sparse.GetData( &cpu_out_from_sparse );
+    n_diff_byte = memcmp( &cpu_out_from_dense[0], &cpu_out_from_sparse[0],
+                          sizeof(float) * NUM_ROWS * 128 );
+    cout << CurrentTime() << ") number of different bytes " << n_diff_byte << endl;
+    if ( 0 == n_diff_byte ) {
+        cout << CurrentTime() << ") SparseMatrix::Sgemm seems correct" << endl;
+    }
     return 0;
 }
 #endif
